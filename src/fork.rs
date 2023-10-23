@@ -163,6 +163,11 @@ impl<S: std::fmt::Debug + ForkSource> ReadStorage for ForkStorage<S> {
     fn read_value(&mut self, key: &StorageKey) -> zksync_types::StorageValue {
         self.read_value_internal(key)
     }
+
+    fn get_enumeration_index(&mut self, _key: &StorageKey) -> Option<u64> {
+        // TODO:?
+        unimplemented!()
+    }
 }
 
 impl<S: std::fmt::Debug + ForkSource> ReadStorage for &ForkStorage<S> {
@@ -177,6 +182,11 @@ impl<S: std::fmt::Debug + ForkSource> ReadStorage for &ForkStorage<S> {
 
     fn load_factory_dep(&mut self, hash: H256) -> Option<Vec<u8>> {
         self.load_factory_dep_internal(hash)
+    }
+
+    fn get_enumeration_index(&mut self, _key: &StorageKey) -> Option<u64> {
+        // TODO:?
+        unimplemented!()
     }
 }
 
@@ -372,11 +382,9 @@ impl ForkDetails<HttpForkSource> {
     pub async fn from_network_tx(fork: &str, tx: H256, cache_config: CacheConfig) -> Self {
         let (url, client) = Self::fork_to_url_and_client(fork);
         let tx_details = client.get_transaction_by_hash(tx).await.unwrap().unwrap();
-        let overwrite_chain_id = Some(
-            L2ChainId::try_from(tx_details.chain_id.as_u64()).unwrap_or_else(|err| {
-                panic!("erroneous chain id {}: {:?}", tx_details.chain_id, err,)
-            }),
-        );
+        let overwrite_chain_id = Some(L2ChainId::try_from(tx_details.chain_id).unwrap_or_else(
+            |err| panic!("erroneous chain id {}: {:?}", tx_details.chain_id, err,),
+        ));
         let miniblock_number = MiniblockNumber(tx_details.block_number.unwrap().as_u32());
         // We have to sync to the one-miniblock before the one where transaction is.
         let l2_miniblock = miniblock_number.saturating_sub(1) as u64;

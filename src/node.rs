@@ -7,7 +7,7 @@ use crate::{
     fork::{ForkDetails, ForkSource, ForkStorage},
     formatter,
     observability::Observability,
-    system_contracts::{self, Options, SystemContracts},
+    system_contracts::{self, SystemContracts},
     utils::{
         self, adjust_l1_gas_price_for_tx, bytecode_to_factory_dep, create_debug_output,
         not_implemented, to_human_size, IntoBoxedFuture,
@@ -28,6 +28,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::eth_test::EthTestNodeNamespaceT;
 use vm::{
     constants::{
         BLOCK_GAS_LIMIT, BLOCK_OVERHEAD_PUBDATA, ETH_CALL_GAS_LIMIT, MAX_PUBDATA_PER_BLOCK,
@@ -477,8 +478,18 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
         let execution_mode = TxExecutionMode::EstimateFee;
         let (mut batch_env, _) = self.create_l1_batch_env(storage.clone());
         batch_env.l1_gas_price = l1_gas_price;
+        let impersonating = if self
+            .impersonated_accounts
+            .contains(&l2_tx.common_data.initiator_address)
+        {
+            true
+        } else {
+            false
+        };
         let system_env = self.create_system_env(
-            self.system_contracts.contracts_for_fee_estimate().clone(),
+            self.system_contracts
+                .contracts_for_fee_estimate(impersonating)
+                .clone(),
             execution_mode,
         );
 
@@ -834,6 +845,15 @@ pub struct InMemoryNodeConfig {
 /// All contents are removed when object is destroyed.
 pub struct InMemoryNode<S> {
     inner: Arc<RwLock<InMemoryNodeInner<S>>>,
+}
+
+// Derive doesn't work
+impl<S> Clone for InMemoryNode<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 fn contract_address_from_tx_result(execution_result: &VmExecutionResultAndLogs) -> Option<H160> {
@@ -1215,8 +1235,6 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
 
         let (batch_env, block_ctx) = inner.create_l1_batch_env(storage.clone());
 
-        // if we are impersonating an account, we need to use non-verifying system contracts
-        let nonverifying_contracts;
         let bootloader_code = {
             if inner
                 .impersonated_accounts
@@ -1226,11 +1244,9 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                     "🕵️ Executing tx from impersonated account {:?}",
                     l2_tx.common_data.initiator_address
                 );
-                nonverifying_contracts =
-                    SystemContracts::from_options(&Options::BuiltInWithoutSecurity);
-                nonverifying_contracts.contracts(execution_mode)
+                inner.system_contracts.contracts(execution_mode, true)
             } else {
-                inner.system_contracts.contracts(execution_mode)
+                inner.system_contracts.contracts(execution_mode, false)
             }
         };
         let system_env = inner.create_system_env(bootloader_code.clone(), execution_mode);
@@ -2121,7 +2137,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                         max_priority_fee_per_gas: Some(
                             info.tx.common_data.fee.max_priority_fee_per_gas,
                         ),
-                        chain_id: U256::from(chain_id),
+                        chain_id,
                         l1_batch_number: Some(U64::from(info.batch_number as u64)),
                         l1_batch_tx_index: None,
                     })
@@ -2897,6 +2913,113 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                 reward,
             })
         })
+    }
+}
+
+impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthTestNodeNamespaceT
+    for InMemoryNode<S>
+{
+    /// Sends a transaction to the L2 network. Can be used for the impersonated account.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx` - A `CallRequest` struct representing the transaction.
+    ///
+    /// # Returns
+    ///
+    /// A future that resolves to the hash of the transaction if successful, or an error if the transaction is invalid or execution fails.
+    fn send_transaction(
+        &self,
+        tx: zksync_types::transaction_request::CallRequest,
+    ) -> jsonrpc_core::BoxFuture<jsonrpc_core::Result<zksync_basic_types::H256>> {
+        let chain_id = match self.inner.read() {
+            Ok(reader) => reader.fork_storage.chain_id,
+            Err(_) => {
+                return futures::future::err(into_jsrpc_error(Web3Error::InternalError)).boxed()
+            }
+        };
+
+        // TODO: refactor the way the transaction is converted
+        let mut tx_req = TransactionRequest::from(tx.clone());
+        // EIP-1559 gas fields should be processed separately
+        if tx.gas_price.is_some() {
+            if tx.max_fee_per_gas.is_some() || tx.max_priority_fee_per_gas.is_some() {
+                return futures::future::err(into_jsrpc_error(Web3Error::InvalidTransactionData(
+                    zksync_types::ethabi::Error::InvalidData,
+                )))
+                .boxed();
+            }
+        } else {
+            tx_req.gas_price = tx.max_fee_per_gas.unwrap_or_default();
+            tx_req.max_priority_fee_per_gas = tx.max_priority_fee_per_gas;
+            if tx_req.transaction_type.is_none() {
+                tx_req.transaction_type = Some(zksync_types::EIP_1559_TX_TYPE.into());
+            }
+        }
+        // To be successfully converted into l2 tx
+        tx_req.r = Some(U256::default());
+        tx_req.s = Some(U256::default());
+        tx_req.v = Some(U64::from(27));
+
+        let hash = match tx_req.get_tx_hash(chain_id) {
+            Ok(result) => result,
+            Err(e) => {
+                return futures::future::err(into_jsrpc_error(Web3Error::SerializationError(e)))
+                    .boxed()
+            }
+        };
+        let bytes = tx_req.get_signed_bytes(
+            &PackedEthSignature::from_rsv(&H256::default(), &H256::default(), 27),
+            chain_id,
+        );
+        let mut l2_tx: L2Tx = match L2Tx::from_request(tx_req, MAX_TX_SIZE) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return futures::future::err(into_jsrpc_error(Web3Error::SerializationError(e)))
+                    .boxed()
+            }
+        };
+        // For non-legacy txs v was overwritten with 0 while converting into l2 tx
+        let mut signature = vec![0u8; 65];
+        signature[64] = 27;
+        l2_tx.common_data.signature = signature;
+
+        l2_tx.set_input(bytes, hash);
+        if hash != l2_tx.hash() {
+            return futures::future::err(into_jsrpc_error(Web3Error::InvalidTransactionData(
+                zksync_types::ethabi::Error::InvalidData,
+            )))
+            .boxed();
+        };
+
+        match self.inner.read() {
+            Ok(reader) => {
+                if !reader
+                    .impersonated_accounts
+                    .contains(&l2_tx.common_data.initiator_address)
+                {
+                    return futures::future::err(into_jsrpc_error(
+                        Web3Error::InvalidTransactionData(zksync_types::ethabi::Error::InvalidData),
+                    ))
+                    .boxed();
+                }
+            }
+            Err(_) => {
+                return futures::future::err(into_jsrpc_error(Web3Error::InternalError)).boxed()
+            }
+        }
+
+        match self.run_l2_tx(l2_tx.clone(), TxExecutionMode::VerifyExecute) {
+            Ok(_) => Ok(hash).into_boxed_future(),
+            Err(e) => {
+                let error_message = format!("Execution error: {}", e);
+                futures::future::err(into_jsrpc_error(Web3Error::SubmitTransactionError(
+                    error_message,
+                    l2_tx.hash().as_bytes().to_vec(),
+                )))
+                .boxed()
+            }
+        }
     }
 }
 

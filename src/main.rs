@@ -19,6 +19,7 @@ mod configuration_api;
 mod console_log;
 mod debug;
 mod deps;
+mod eth_test;
 mod evm;
 mod filters;
 mod fork;
@@ -52,6 +53,7 @@ use futures::{
 use jsonrpc_core::MetaIoHandler;
 use zksync_basic_types::{L2ChainId, H160, H256};
 
+use crate::eth_test::EthTestNodeNamespaceT;
 use crate::{configuration_api::ConfigurationApiNamespace, node::TEST_NODE_NETWORK_ID};
 use zksync_core::api_server::web3::backend_jsonrpc::namespaces::{
     debug::DebugNamespaceT, eth::EthNamespaceT, net::NetNamespaceT, zks::ZksNamespaceT,
@@ -119,7 +121,8 @@ async fn build_json_http<
 
     let io_handler = {
         let mut io = MetaIoHandler::with_middleware(LoggingMiddleware::new(log_level_filter));
-        io.extend_with(node.to_delegate());
+        io.extend_with(EthNamespaceT::to_delegate(node.clone()));
+        io.extend_with(EthTestNodeNamespaceT::to_delegate(node));
         io.extend_with(net.to_delegate());
         io.extend_with(config_api.to_delegate());
         io.extend_with(evm.to_delegate());
